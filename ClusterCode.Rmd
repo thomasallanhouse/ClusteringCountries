@@ -1,0 +1,981 @@
+---
+title: "Clustering Countries Code"
+author: "Leo Gada and Mwandida Kamba Afuleni"
+date: "2025-11-06"
+output:
+  html_document:
+    toc: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libraries}
+
+library(tidyverse)
+library(readxl)
+library(factoextra)
+library(NbClust)
+library(mice)
+library(viridis)
+library(stargazer)
+
+```
+
+## Analysis Structure
+
+This markdown document contains the clustering procedure to group Countries based on a set of characteristics. The clustering is meant to reduce the number of parameters in the Bayesian Hierarchical Model for *H5N1 Infection Fatality Ratios*, so that instead of country-year specific parameters we have cluster-year specific parameters at most.
+
+The characteristics used (at least in principle) for clustering are indicators found on WorldBank:
+
+* Population Total
+* Current Health Expenditure (as percentage of (% GDP)
+* GDP Per Capita
+* Multidimensional Poverty Headcount Ratio (UNDP) (% population)
+* Poverty Headcount ratio at Societal Poverty Lne (% population)
+* Rural Population
+* Prevalence of HIV, total (% population ages 15-49)
+* Incidence of tuberculosis (per 100,000 people)
+* Diabetes Prevalence (% population ages 20-79)
+* Hospital beds (per 1,000 people)
+* Physicians (per 1,000 people)
+* Death rate, Crude (per 1,000 people)
+* Rural land area (sq. Km)
+* Surface area sq. Km
+
+Depending on the variables' behaviour as a group (collinearity) we might have to remove some in the actual clustering step.
+
+The analysis will be structured as follows:
+
+* A is the pre-processing, including cleaning and correlations 
+* B is the missing data imputation procedure and normalisation
+* C is the actual clustering phase
+
+## Part A
+
+```{r Read and Clean Data}
+
+# Data Some means it only contains some countries (i.e. the ones on the WHO tracker)
+
+library(readxl)
+library(openxlsx)
+
+data_some <- read.csv("./WorldData.csv")
+
+# Examine the data
+
+str(data_some)
+summary(data_some)
+
+# Replace the .. with NA
+
+data_some[data_some == '..'] <- NA
+data_some
+
+# Rename columns with names that are likely to cause issues
+
+names(data_some)[c(3,5,6,8,9,10,13,14,15)] <- c("HealthExp_PercGDP",
+                                       "UNDP_PovRatio_PercPop",
+                                       "SocLine_PovRatio_PercPop",
+                                       "PrevHIV_PercPop1549",
+                                       "IncTB_Per100k",
+                                       "PrevDiab_PercPop2079",
+                                       "Crude_Death_rate_Per1000",
+                                       "Rural_Land_Area_Sq_Km",
+                                       "Surface_Area_Sq_Km")
+ 
+# # Turn the character columns in numeric apart from Country
+
+data_some$HealthExp_PercGDP <- as.numeric(data_some$HealthExp_PercGDP)
+data_some$GDP_per_Capita <- as.numeric(data_some$GDP_per_Capita)
+data_some$UNDP_PovRatio_PercPop <- as.numeric(data_some$UNDP_PovRatio_PercPop)
+data_some$SocLine_PovRatio_PercPop <- as.numeric(data_some$SocLine_PovRatio_PercPop)
+data_some$Population_Rural <- as.numeric(data_some$Population_Rural)
+data_some$PrevHIV_PercPop1549 <- as.numeric(data_some$PrevHIV_PercPop1549)
+data_some$IncTB_Per100k <- as.numeric(data_some$IncTB_Per100k)
+data_some$PrevDiab_PercPop2079 <- as.numeric(data_some$PrevDiab_PercPop2079)
+data_some$Hospital_beds_1000ppl <- as.numeric(data_some$Hospital_beds_1000ppl)
+data_some$Physicians_1000ppl <- as.numeric(data_some$Physicians_1000ppl)
+data_some$Rural_Land_Area_Sq_Km <- as.numeric(data_some$Rural_Land_Area_Sq_Km)
+data_some$Surface_Area_Sq_Km <- as.numeric(data_some$Surface_Area_Sq_Km)
+
+Country1 <- data_some$Country
+```
+
+Before we start doing anything, we want to understand our data a bit better. Because we are using indicators, there might be high correlations between some of the variables in our dataset. If that's the case, we want to address it and transform or drop variables before this becomes an issue in the analysis. 
+
+```{r Examine Correlation}
+
+pairs(data_some[-1]) # pairs plot, notice we remove the Country column
+
+data_some_corr <- as.data.frame(cor(data_some[-1], method = "pearson", use = "complete.obs")) # calculate Pearson's coefficient pairwise
+
+```
+
+Looking at the correlation patterns between the numerical variables, we notice that Population Total and Population Rural are highly correlated. Multidimensional poverty head count ratio (UNDP) is highly correlated with Poverty head count ratio at societal poverty line and, the Rural land area is highly correlated with the surface area. 
+We consider "Highly correlated" variables with a Pearson's Correlation Coefficient above 0.80.
+
+To keep as much information as we can we:
+
+* Keep Population Rural and drop population total
+* Keep  Multidimensional poverty head count ratio (UNDP) and drop Poverty head count ratio at societal   poverty line
+* Keep Rural land area, drop the surface area. 
+
+```{r Clear Correlation Pattern}
+
+# Drop variables listed in the paragraph above this chunk
+library(dplyr)
+data_some <- data_some %>% dplyr::select(-c(Population_Total,
+                                     SocLine_PovRatio_PercPop,
+                                     Surface_Area_Sq_Km))
+
+# Re-examine correlation
+
+pairs(data_some[-1]) # pairs plot, notice we remove the Country column
+
+data_some_corr <- as.data.frame(cor(data_some[-1], method = "pearson", use = "complete.obs")) # calculate Pearson's coefficient pairwise
+
+```
+Now the correlations seems to never get so extreme. 
+
+
+## Part B
+
+At this stage, we want to address the missingness in the dataset. The R package [MICE](https://cran.r-project.org/web/packages/mice/mice.pdf) and the accompanying [vignettes](https://www.gerkovink.com/miceVignettes/) will be our tools.
+Through exploring the missingness pattern below, we notice that the missing values affect the two poverty ratio metrics and the HIV prevalence.
+
+The code throws errors at us about matrix singularity, this is usually due to high collinearity (see [troubleshooting](https://library.virginia.edu/data/articles/getting-started-with-multiple-imputation-in-r)). If we run the imputation adding variables one by one, we notice that it's Population Rural causing issues. Therefore, we run the algorithm with the chosen method with everything but country and Population Rural in, and then with the Classification and Regression Trees method with it in.
+
+
+
+
+```{r Missing Data}
+library(mice)
+
+md.pattern(data_some, rotate.names = TRUE) # examine missingness pattern
+
+# We run the mice code with 0 iterations to get some info on how MICE plans to proceed
+
+imputed_data <- mice(data_some, maxit=0)
+predM <- imputed_data$predictorMatrix # Extract predictor matrix (i.e. which variables predict which missing variables)
+meth <- imputed_data$method           # Extract method of imputation per variable
+
+# Perform multiple imputation
+# Method 
+# The m =  N means we get N datasets with N different imputations - if you have more than one then you have to pool to make inference. maxit = k means k number of iterations
+
+imputed_data_1 <- mice(data_some[-1], m = 1, method = 'cart', maxit = 50, print = F)
+
+# Plot the iteration trace plot for convergence diagnostics. (default = 5 iterations)
+
+plot(imputed_data_1)
+
+# Diagnostics of value range
+#Stripplot diagnostics comparing imputed (red) and observed (blue) values for #variables with missing data. The substantial overlap between red and blue points #across all indicators indicates that the imputed values are consistent with the #observed data, suggesting plausible imputations
+
+stripplot(imputed_data_1, pch=20, cex=2)
+
+# Extract the actual element form the object resulting from mice()
+
+imp_dataset_1 <- complete(imputed_data_1, 1) # take the first imputed dataset
+
+# Let's re-add in the variables we removed (i.e. Country and Population Rural)
+
+imp_dataset_1$Population_Rural <- data_some$Population_Rural
+
+```
+
+We can proceed to rescale the dataset, which is good practice before clustering to avoid magnifying or shrinking distances between features simply due to the way they get projected. There's many ways to do this, we use the z-score standardisation.
+
+```{r Rescaling}
+
+# Z-score normalisation, that is subtracting the mean and dividing by the standard deviation
+
+imp_dataset_scaled_1 <- as.data.frame(round(scale(imp_dataset_1), digits = 2)) 
+
+# Let's re-add Country in
+
+imp_dataset_scaled_1$Country <- data_some$Country
+
+
+```
+
+## Part C
+
+We proceed to cluster countries with hierarchical clustering with:
+
+* Manhattan distance
+* Complete linkage and complete linkage
+* Use silhouette plot/elbow plot (or similar) to decide on number of clusters.
+
+We follow:
+
+* https://www.datacamp.com/tutorial/hierarchical-clustering-R 
+* https://www.geeksforgeeks.org/hierarchical-clustering-in-r-programming/ 
+
+
+```{r Clustering}
+
+# Create distance matrix
+
+dist_scaled_1 <- dist(imp_dataset_scaled_1[-12], method = 'manhattan') # note we don't read "Country" in, it's not a feature to use
+
+# 3. Perform hierarchical clustering (Complete linkage method) and create dendrogram
+
+hclust_complete_1 <- hclust(dist_scaled_1, method = 'complete')
+plot(hclust_complete_1, main = "Complete Linkage Dendrogram (CART)")
+
+```
+
+Now we need to decide where to cut the tree using dynamicTreeCut package. We use automated method, and a preference for less rather than more clusters.
+
+```{r Cutting Tree}
+
+# Load the dynamicTreeCut package
+if (!requireNamespace("dynamicTreeCut", quietly = TRUE)) {
+  install.packages("dynamicTreeCut")
+}
+library(dynamicTreeCut)
+
+
+# Apply dynamic tree cut to obtain cluster memberships. 
+#
+#Here, we input a dendrogram only, as such, the algorithm uses the default "Tree" method. When both a dendrogram and a distance matrix are provided, the method automatically switches to "Hybrid".
+
+cut_complete_1 <- cutreeDynamic(hclust_complete_1, deepSplit = 1, respectSmallClusters = TRUE, verbose = 0)
+
+
+# Plot dendrograms with cluster rectangles. k is the number of clusters
+
+plot(hclust_complete_1, main = "Hierarchical Clustering Dendrogram (CART)", xlab = "", sub = "")
+rect.hclust(hclust_complete_1, k = max(cut_complete_1), border = "red")  # Use cut_complete_1
+
+```
+
+The subdivisions are highlighted in the graphs by rectangles.
+
+Now we can reveal which countries fall within which cluster.
+
+```{r Memberships Reveal}
+
+# Merge grouping to Country vector
+
+clustering_complete_1 <- as.data.frame(cbind(cut_complete_1, imp_dataset_scaled_1$Country))
+
+# Export data in excel form
+library(writexl)
+
+```
+
+```{r Summary Statistics 1}
+Indicators_df <- imp_dataset_1 
+Indicators_df <- cbind(Country1 = Country1, Indicators_df)
+
+names0 <- c('Australia', 'Canada', 'Spain', 'United Kingdom', 'United States')
+Cluster0 <- Indicators_df[Indicators_df$Country1 %in% names0, ]
+
+names1 <- c('Bangladesh', 'Cambodia', 'China', 'Djibouti', 'India', 'Indonesia', "Lao PDR", 'Myanmar', 'Nepal', 'Nigeria', 'Pakistan', 'Thailand', 'Viet Nam')
+Cluster1 <- Indicators_df[Indicators_df$Country1 %in% names1, ]
+
+names2 <- c('Azerbaijan', 'Ecuador', 'Egypt, Arab Rep.', 'Iraq', 'Turkiye')
+Cluster2 <- Indicators_df[Indicators_df$Country1 %in% names2, ]
+
+names3 <- c('Chile')
+Cluster3 <- Indicators_df[Indicators_df$Country1 %in% names3, ]
+
+
+#Compare summary statistics across the 4 clusters
+# Function to summarize a data frame
+summary_stats <- function(df, name) {
+  df %>%
+    summarise(across(everything(), list(mean = mean, sd = sd, min = min, max = max))) %>%
+    mutate(DataFrame = name)  # Add a column for dataset name
+}
+
+# Apply function to each data frame
+Cluster1_summary <- summary_stats(Cluster0[-1], "Cluster1")
+Cluster2_summary <- summary_stats(Cluster1[-1], "Cluster2")
+Cluster3_summary <- summary_stats(Cluster2[-1], "Cluster3")
+Cluster4_summary <- summary_stats(Cluster3[-1], "Cluster4")
+
+# Combine all summaries
+comparison <- bind_rows(Cluster1_summary, Cluster2_summary, Cluster3_summary, Cluster4_summary)
+
+# Reorder columns to move "DataFrame" to the first position
+comparison <- comparison %>% select(DataFrame, everything())
+
+# Print the summary comparison
+print(comparison)
+
+```
+
+
+```{r box plots 1}
+#boxplot HealthExp_PercGDP
+
+Cluster0$Cluster <- "Cluster0"
+Cluster1$Cluster <- "Cluster1"
+Cluster2$Cluster <- "Cluster2"
+Cluster3$Cluster <- "Cluster3"
+
+# Stack them together
+combined_df1 <- bind_rows(
+  Cluster0 %>% select(Cluster, Value = HealthExp_PercGDP),
+  Cluster1 %>% select(Cluster, Value = HealthExp_PercGDP),
+  Cluster2 %>% select(Cluster, Value = HealthExp_PercGDP),
+  Cluster3 %>% select(Cluster, Value = HealthExp_PercGDP)
+  
+)
+custom_colors <- c("#440154", "#3B528B", "#5DC863", "#FDE725" )
+#View(combined_df)
+ggplot(combined_df1, aes(x = Cluster, y = Value, fill = Cluster)) +
+  geom_boxplot() +
+  labs(title = "Health Expenditure (% GDP)",
+       x = "",
+       y = "") +
+  theme_minimal() +
+  scale_fill_manual(values = custom_colors) #scale_fill_viridis_d() 
+  #scale_fill_brewer(palette = "Set3")  # Optional color scheme
+
+
+```
+
+```{r box plots 2}
+#boxplot UNDP_PovRatio_PercPop 
+
+Cluster0$Cluster <- "Cluster0"
+Cluster1$Cluster <- "Cluster1"
+Cluster2$Cluster <- "Cluster2"
+Cluster3$Cluster <- "Cluster3"
+
+# Stack them together
+combined_df2 <- bind_rows(
+  Cluster0 %>% select(Cluster, Value = UNDP_PovRatio_PercPop),
+  Cluster1 %>% select(Cluster, Value = UNDP_PovRatio_PercPop),
+  Cluster2 %>% select(Cluster, Value = UNDP_PovRatio_PercPop),
+  Cluster3 %>% select(Cluster, Value = UNDP_PovRatio_PercPop)
+  
+)
+custom_colors <- c("#440154", "#3B528B", "#5DC863", "#FDE725")
+ggplot(combined_df2, aes(x = Cluster, y = Value, fill = Cluster)) +
+  geom_boxplot() +
+  labs(title = "Multidimensional Poverty Headcount Ratio (UNDP) (%
+population)",
+       x = "",
+       y = "") +
+  theme_minimal() +
+  scale_fill_manual(values = custom_colors)
+
+```
+
+```{r box plots 3}
+#boxplot Hospital_beds_1000ppl
+
+Cluster0$Cluster <- "Cluster0"
+Cluster1$Cluster <- "Cluster1"
+Cluster2$Cluster <- "Cluster2"
+Cluster3$Cluster <- "Cluster3"
+
+# Stack them together
+combined_df3 <- bind_rows(
+  Cluster0 %>% select(Cluster, Value = Hospital_beds_1000ppl),
+  Cluster1 %>% select(Cluster, Value = Hospital_beds_1000ppl),
+  Cluster2 %>% select(Cluster, Value = Hospital_beds_1000ppl),
+  Cluster3 %>% select(Cluster, Value = Hospital_beds_1000ppl)
+  
+)
+custom_colors <- c("#440154", "#3B528B", "#5DC863", "#FDE725")
+ggplot(combined_df3, aes(x = Cluster, y = Value, fill = Cluster)) +
+  geom_boxplot() +
+  labs(title = "Hospital beds (per 1,000 people)",
+       x = "",
+       y = "") +
+  theme_minimal() +
+  scale_fill_manual(values = custom_colors)
+
+
+```
+
+
+
+
+
+```{r box plots 4}
+#boxplot Physicians_1000ppl
+
+Cluster0$Cluster <- "Cluster0"
+Cluster1$Cluster <- "Cluster1"
+Cluster2$Cluster <- "Cluster2"
+Cluster3$Cluster <- "Cluster3"
+
+# Stack them together
+combined_df4 <- bind_rows(
+  Cluster0 %>% select(Cluster, Value = Physicians_1000ppl),
+  Cluster1 %>% select(Cluster, Value = Physicians_1000ppl),
+  Cluster2 %>% select(Cluster, Value = Physicians_1000ppl),
+  Cluster3 %>% select(Cluster, Value = Physicians_1000ppl)
+  
+)
+
+custom_colors <- c("#440154", "#3B528B", "#5DC863", "#FDE725")
+#View(combined_df)
+ggplot(combined_df4, aes(x = Cluster, y = Value, fill = Cluster)) +
+  geom_boxplot() +
+  labs(title = "Physicians (per 1,000 people)",
+       x = "",
+       y = "") +
+  theme_minimal() +
+  scale_fill_manual(values = custom_colors)
+
+
+```
+
+W H O
+
+```{r Summary Statistics 2}
+Indicators_df <- imp_dataset_1 
+Indicators_df <- cbind(Country1 = Country1, Indicators_df)
+
+WHOnames1 <- c('Australia', 'Cambodia', 'China', "Lao PDR", 'Myanmar', 'Thailand', 'Viet Nam')
+Western_Pacific <- Indicators_df[Indicators_df$Country1 %in% WHOnames1, ]
+
+WHOnames2 <- c('Bangladesh', 'India', 'Indonesia', 'Nepal')
+South_East_Asia <- Indicators_df[Indicators_df$Country1 %in% WHOnames2, ]
+
+WHOnames3 <- c('Djibouti', 'Nigeria')
+Africa <- Indicators_df[Indicators_df$Country1 %in% WHOnames3, ]
+
+WHOnames4 <- c('Egypt, Arab Rep.', 'Iraq', 'Pakistan')
+Eastern_Mediterranean <- Indicators_df[Indicators_df$Country1 %in% WHOnames4, ]
+
+WHOnames5 <- c('Azerbaijan', 'Spain', 'United Kingdom', 'Turkiye')
+European <- Indicators_df[Indicators_df$Country1 %in% WHOnames5, ]
+
+WHOnames6 <- c('Canada', 'United States', 'Ecuador', 'Chile')
+Americas <- Indicators_df[Indicators_df$Country1 %in% WHOnames6, ]
+
+#Compare summary statistics across the 4 clusters
+# Function to summarize a data frame
+summary_stats <- function(df, name) {
+  df %>%
+    summarise(across(everything(), list(mean = mean, sd = sd, min = min, max = max))) %>%
+    mutate(DataFrame = name)  # Add a column for dataset name
+}
+
+# Apply function to each data frame
+Western_Pacific_summary <- summary_stats(Western_Pacific[-1], "Western_Pacific")
+South_East_Asia_summary <- summary_stats(South_East_Asia[-1], "South_East_Asia")
+Africa_summary <- summary_stats(Africa[-1], "Africa")
+Eastern_Mediterranean_summary <- summary_stats(Eastern_Mediterranean[-1], "Eastern_Mediterranean")
+European_summary <- summary_stats(European[-1], "European")
+Americas_summary <- summary_stats(Americas[-1], "Americas")
+
+# Combine all summaries
+WHOcomparison <- bind_rows(Western_Pacific_summary, South_East_Asia_summary, Africa_summary, Eastern_Mediterranean_summary,European_summary, Americas_summary)
+
+# Reorder columns to move "DataFrame" to the first position
+WHOcomparison <- WHOcomparison %>% select(DataFrame, everything())
+
+# Print the summary comparison
+print(WHOcomparison)
+
+
+```
+
+WORLD BANK
+
+```{r Summary Statistics 3}
+Indicators_df <- imp_dataset_1 
+Indicators_df <- cbind(Country1 = Country1, Indicators_df)
+
+WBnames1 <- c('Australia', 'Canada', 'Spain', 'United Kingdom', 'United States', 'Chile')
+High_income_countries <- Indicators_df[Indicators_df$Country1 %in% WBnames1, ]
+
+WBnames2 <- c('Azerbaijan', 'China', 'Turkiye', 'Thailand', 'Indonesia', 'Iraq', 'Ecuador', 'Egypt, Arab Rep.', 'Viet Nam')
+Upper_Middle_income_countries <- Indicators_df[Indicators_df$Country1 %in% WBnames2, ]
+
+
+WBnames3 <- c('Bangladesh', 'India', 'Nigeria', 'Pakistan', 'Myanmar', "Lao PDR", 'Nepal', 'Cambodia', 'Djibouti')
+Lower_Middle_income_countries <- Indicators_df[Indicators_df$Country1 %in% WBnames3, ]
+
+#Compare summary statistics across the 4 clusters
+# Function to summarize a data frame
+summary_stats <- function(df, name) {
+  df %>%
+    summarise(across(everything(), list(mean = mean, sd = sd, min = min, max = max))) %>%
+    mutate(DataFrame = name)  # Add a column for dataset name
+}
+
+# Apply function to each data frame
+High_income_countries_summary <- summary_stats(High_income_countries[-1], "High_income_countries")
+Upper_Middle_income_countries_summary <- summary_stats(Upper_Middle_income_countries[-1], "Upper_Middle_income_countries")
+Lower_Middle_income_countries_summary <- summary_stats(Lower_Middle_income_countries[-1], "Lower_Middle_income_countries")
+
+# Combine all summaries
+WBcomparison <- bind_rows(High_income_countries_summary, Upper_Middle_income_countries_summary, Lower_Middle_income_countries_summary)
+
+# Reorder columns to move "DataFrame" to the first position
+WBcomparison <- WBcomparison %>% select(DataFrame, everything())
+
+# Print the summary comparison
+print(WBcomparison)
+
+```
+
+U N
+
+```{r Summary Statistics 4}
+Indicators_df <- imp_dataset_1 
+Indicators_df <- cbind(Country1 = Country1, Indicators_df)
+
+UNnames1 <- c('Azerbaijan', 'China', 'Cambodia', 'Indonesia', "Lao PDR", 'Myanmar', 'Thailand', 'Viet Nam', 'Bangladesh', 'India', 'Nepal', 'Pakistan', 'Iraq', 'Turkiye')
+Asia <- Indicators_df[Indicators_df$Country1 %in% UNnames1, ]
+
+UNnames2 <- c('Egypt, Arab Rep.', 'Djibouti', 'Nigeria')
+Afric <- Indicators_df[Indicators_df$Country1 %in% UNnames2, ]
+
+
+UNnames3 <- c('Spain', 'United Kingdom')
+Europe <- Indicators_df[Indicators_df$Country1 %in% UNnames3, ]
+
+UNnames3 <- c('Canada', 'United States', 'Ecuador', 'Chile')
+America <- Indicators_df[Indicators_df$Country1 %in% UNnames3, ]
+
+UNnames3 <- c('Australia')
+Ocean <- Indicators_df[Indicators_df$Country1 %in% UNnames3, ]
+
+#Compare summary statistics across the 4 clusters
+# Function to summarize a data frame
+summary_stats <- function(df, name) {
+  df %>%
+    summarise(across(everything(), list(mean = mean, sd = sd, min = min, max = max))) %>%
+    mutate(DataFrame = name)  # Add a column for dataset name
+}
+
+# Apply function to each data frame
+Asia_summary <- summary_stats(Asia[-1], "Asia")
+Afric_summary <- summary_stats(Afric[-1], "Afric")
+Europe_summary <- summary_stats(Europe[-1], "Europe")
+America_summary <- summary_stats(America[-1], "America")
+Ocean_summary <- summary_stats(Ocean[-1], "Ocean")
+
+
+# Combine all summaries
+UNcomparison <- bind_rows(Asia_summary, Afric_summary, Europe_summary, America_summary, Ocean_summary)
+
+# Reorder columns to move "DataFrame" to the first position
+UNcomparison <- UNcomparison %>% select(DataFrame, everything())
+
+# Print the summary comparison
+print(UNcomparison)
+
+```
+
+Bubble plots - H5N1 Countries
+
+```{r}
+library(ggplot2)
+
+AvianCountriesDF<- Indicators_df[Indicators_df$Country1 %in% c('Australia', 'Canada', 'Spain', 'United Kingdom', 'United States','Bangladesh', 'Cambodia', 'China', 'Djibouti', 'India', 'Indonesia', "Lao PDR", 'Myanmar', 'Nepal', 'Nigeria', 'Pakistan', 'Thailand', 'Viet Nam', 'Azerbaijan', 'Ecuador', 'Egypt, Arab Rep.', 'Iraq', 'Turkiye', 'Chile'), ]
+
+AvianCountriesDF$Hospital_beds_1000ppl <- round(AvianCountriesDF$Hospital_beds_1000ppl, 0)
+AvianCountriesDF$Physicians_1000ppl <- round(AvianCountriesDF$Physicians_1000ppl, 0)
+
+# Create bubble plot
+ggplot(AvianCountriesDF, aes(x = HealthExp_PercGDP, y = UNDP_PovRatio_PercPop, size = Physicians_1000ppl, color = as.factor(Hospital_beds_1000ppl)))+ #as.factor(cyl))) +
+  geom_point(alpha = 0.6) +
+  scale_size_continuous(range = c(2, 12)) +
+  labs(
+    title = "Health Expenditure (% GDP) vs UNDP Poverty Ratio (% Population)",
+    x = "Health Expenditure (% GDP)",
+    y = "UNDP Poverty Ratio (% Population)",
+    size = "Physicians per 1000 people",
+    color = "Hospital beds per 1000 people"
+  ) +
+  theme_minimal()
+
+```
+
+Bubble plots - H5N1 Clusters
+
+```{r}
+
+
+
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+AvianClustersDF <- comparison %>%
+  rename(Cluster = DataFrame) %>%           # rename the column
+  mutate(Cluster = dplyr::recode_factor(Cluster,  # recode
+                                        "Cluster1" = "Cluster 0",
+                                        "Cluster2" = "Cluster 1",
+                                        "Cluster3" = "Cluster 2",
+                                        "Cluster4" = "Cluster 3"))
+
+# Round numeric variables
+AvianClustersDF$Hospital_beds_1000ppl_mean <- round(AvianClustersDF$Hospital_beds_1000ppl_mean, 0)
+AvianClustersDF$Physicians_1000ppl_mean <- round(AvianClustersDF$Physicians_1000ppl_mean, 0)
+
+# Plot
+ggplot(AvianClustersDF, aes(
+    x = HealthExp_PercGDP_mean,
+    y = UNDP_PovRatio_PercPop_mean,
+    size = Physicians_1000ppl_mean,
+    color = as.factor(Hospital_beds_1000ppl_mean)
+  )) +
+  geom_point(alpha = 0.6) +
+  geom_text(aes(label = Cluster), vjust = -1.5, size = 4, fontface = "bold", show.legend = FALSE) +
+  scale_color_discrete(guide = guide_legend(override.aes = list(shape = 16, size = 5))) +
+  scale_size_continuous(range = c(3, 13)) +
+  labs(
+    title = "Health Expenditure (% GDP) versus UNDP Poverty Ratio (% population)",
+    x = "Health Expenditure (% GDP)",
+    y = "UNDP Poverty Ratio (% population)",
+    size = "Physicians \nper 1000 people",
+    color = "Hospital Beds \nper 1000 people"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+
+```
+
+```{r}
+
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+AvianClustersDF1 <- comparison %>%
+  rename(Cluster = DataFrame) %>%           # rename the column
+  mutate(Cluster = dplyr::recode_factor(Cluster,  # recode
+                                        "Cluster1" = "Cluster 0",
+                                        "Cluster2" = "Cluster 1",
+                                        "Cluster3" = "Cluster 2",
+                                        "Cluster4" = "Cluster 3"))
+
+# Round numeric variables
+AvianClustersDF1$GDP_per_Capita_mean <- round(AvianClustersDF1$GDP_per_Capita_mean, 0)
+AvianClustersDF1$Crude_Death_rate_Per1000_mean <-round(AvianClustersDF1$Crude_Death_rate_Per1000_mean, 0)
+
+# Plot
+ggplot(AvianClustersDF1, aes(
+    x = PrevHIV_PercPop1549_mean,
+    y = IncTB_Per100k_mean,
+    size = GDP_per_Capita_mean,
+    color = as.factor(Crude_Death_rate_Per1000_mean)
+  )) +
+  geom_point(alpha = 0.6) +
+  geom_text(aes(label = Cluster), vjust = -1.5, size = 4, fontface = "bold", show.legend = FALSE) +
+  scale_color_discrete(guide = guide_legend(override.aes = list(shape = 16, size = 5))) +
+  scale_size_continuous(range = c(3, 13)) +
+  labs(
+    title = "HIV Prevalence in 15 - 49 Age Group (% population) versus \nTB Incidence per 100,000 people",
+    x = "HIV Prevalence in 15 - 49 age group (% population)",
+    y = "TB Incidence per 100,000 people",
+    size = "GDP per capita",
+    color = "Crude Death Rate \nper 1000 people"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+
+```
+
+Plot of CFR's
+
+```{r}
+library(ggplot2)
+library(ggthemes)  # optional, for themes
+
+cfr_data <- data.frame(
+  Group = c(
+    "Cluster 0", "Cluster 1", "Cluster 2", "Cluster 3",
+    "Western Pacific", "South East Asia", "Africa (WHO)", "Eastern Mediterranean",
+    "European (WHO)", "Americas (WHO)",
+    "High Income", "Upper Middle Income", "Lower Middle Income",
+    "Asia (UN)", "Africa (UN)", "Europe (UN)", "Americas (UN)", "Oceania",
+    "Overall"
+  ),
+  CFR = c(
+    8.25, 66.22, 34.26, 29.29,
+    55.38, 81.23, 50.00, 33.76,
+    34.12, 11.70,
+    7.86, 52.08, 54.87,
+    65.48, 33.58, 8.30, 11.70, 29.29,
+    51.33
+  ),
+  Lower = c(
+    1.23, 62.01, 29.63, 1.26,
+    49.61, 75.61, 9.43, 29.04,
+    18.64, 1.78,
+    1.17, 48.60, 44.70,
+    61.34, 28.85, 0.32, 1.78, 1.26,
+    48.07
+  ),
+  Upper = c(
+    24.87, 70.27, 39.10, 84.19,
+    61.05, 86.10, 90.57, 38.70,
+    52.35, 33.87,
+    23.82, 55.54, 64.78,
+    69.47, 38.54, 36.94, 33.87, 84.19,
+    54.57
+  ),
+  Category = c(
+    rep("Study Clusters", 4),
+    rep("WHO Regions", 6),
+    rep("World Bank", 3),
+    rep("UN Regions", 5),
+    "Overall"
+  )
+)
+library(ggplot2)
+library(viridis)
+
+# Reorder categories and group labels
+cfr_data$Category <- factor(
+  cfr_data$Category,
+  levels = c("Study Clusters", "WHO Regions", "World Bank", "UN Regions", "Overall")
+)
+
+# Reorder group levels to group by Category
+cfr_data$Group <- factor(cfr_data$Group, levels = cfr_data$Group[order(cfr_data$Category, -cfr_data$CFR)])
+
+cfr_data$Group <- factor(cfr_data$Group, levels = c(
+  "Cluster 0", "Cluster 1", "Cluster 2", "Cluster 3", 
+  "Western Pacific", "South East Asia", "Africa (WHO)", "Eastern Mediterranean",
+  "European (WHO)", "Americas (WHO)",
+  "High Income", "Upper Middle Income", "Lower Middle Income",
+  "Asia (UN)", "Africa (UN)", "Europe (UN)", "Americas (UN)", "Oceania",
+  "Overall"
+))
+
+ggplot(cfr_data, aes(x = Group, y = CFR, color = Category)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.3, alpha = 0.7, linewidth = 1.2) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", CFR)),
+    hjust = 0.5, vjust = -0.7, size = 3.2, color = "black"
+  ) +
+  coord_flip() +
+  labs(
+    title = "Case Fatality Rate (CFR) by Cluster with 95% Credible Intervals",
+    x = "",
+    y = "CFR (%)",
+    color = "Clustering Scheme:"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank()
+  ) +
+  scale_color_viridis_d(option = "C") 
+
+```
+
+Forest plot of CFRs
+
+```{r}
+suppressMessages(library(tidyverse))
+library(ggthemes)
+
+# Your CFR data
+cfr_data <- data.frame(
+  Group = c(
+    "Cluster 0", "Cluster 1", "Cluster 2", "Cluster 3",
+    "Western Pacific", "South East Asia", "Africa (WHO)", "Eastern Mediterranean",
+    "European (WHO)", "Americas (WHO)",
+    "High Income", "Upper Middle Income", "Lower Middle Income",
+    "Asia (UN)", "Africa (UN)", "Europe (UN)", "Americas (UN)", "Oceania",
+    "Overall"
+  ),
+  CFR = c(
+    8.25, 66.22, 34.26, 29.29,
+    55.38, 81.23, 50.00, 33.76,
+    34.12, 11.70,
+    7.86, 52.08, 54.87,
+    65.48, 33.58, 8.30, 11.70, 29.29,
+    51.33
+  ),
+  Lower = c(
+    1.23, 62.01, 29.63, 1.26,
+    49.61, 75.61, 9.43, 29.04,
+    18.64, 1.78,
+    1.17, 48.60, 44.70,
+    61.34, 28.85, 0.32, 1.78, 1.26,
+    48.07
+  ),
+  Upper = c(
+    24.87, 70.27, 39.10, 84.19,
+    61.05, 86.10, 90.57, 38.70,
+    52.35, 33.87,
+    23.82, 55.54, 64.78,
+    69.47, 38.54, 36.94, 33.87, 84.19,
+    54.57
+  ),
+  Category = c(
+    rep("Study Clusters", 4),
+    rep("WHO Regions", 6),
+    rep("World Bank", 3),
+    rep("UN Regions", 5),
+    "Overall"
+  )
+)
+
+# Format labels
+cfr_data <- cfr_data %>%
+  mutate(
+    variable = row_number(),
+    estext = paste0(round(CFR, 2), " (", round(Lower, 2), ", ", round(Upper, 2), ")")
+  )
+
+# Custom theme
+theme_ham <- function(base_size = 12, base_family = "sans"){
+  ggthemes::theme_fivethirtyeight(base_size, base_family) +
+    ggplot2::theme(
+      panel.spacing = ggplot2::unit(1.5, 'lines'),
+      panel.border = ggplot2::element_rect(color = "grey50", fill = NA, linewidth = 1, linetype = 1),
+      plot.background = ggplot2::element_rect(fill='white', colour='white'),
+      panel.background = ggplot2::element_rect(fill='white', colour='white'),
+      strip.text = ggplot2::element_text(colour = 'white', face = 'bold'),
+      axis.title = ggplot2::element_text(),
+      strip.background = ggplot2::element_rect(colour = "grey50", fill = "grey50"),
+      legend.background = ggplot2::element_blank(),
+      panel.grid.major = ggplot2::element_line(linetype = 3, linewidth = 0.2)
+    )
+}
+
+# Forest plot
+ggplot(data = cfr_data, aes(x = variable)) +
+  geom_hline(yintercept = 0) +
+  geom_point(aes(y = CFR), size = 2, color = "black", shape = 5) +
+  geom_linerange(
+    aes(
+      ymin = Lower,
+      ymax = Upper
+    ),
+    linewidth = 0.5,
+    color = "black"
+  ) +
+  labs(y = "Case Fatality Rate (%)", x = "") + 
+  theme_ham() + 
+  scale_x_continuous(
+    breaks = cfr_data$variable,
+    labels = cfr_data$Group,
+    sec.axis = sec_axis(
+      ~.,
+      breaks = cfr_data$variable,
+      labels = cfr_data$estext
+    )
+  ) +
+  coord_flip(xlim = c(0.5, nrow(cfr_data) + 0.5))
+
+```
+
+
+```{r}
+library(tidyverse)
+library(ggthemes)
+library(viridis)
+
+# Data
+cfr_data <- data.frame(
+  Group = c(
+    "Cluster 0", "Cluster 1", "Cluster 2", "Cluster 3",
+    "Western Pacific", "South East Asia", "Africa (WHO)", "Eastern Mediterranean",
+    "European (WHO)", "Americas (WHO)",
+    "High Income", "Upper Middle Income", "Lower Middle Income",
+    "Asia (UN)", "Africa (UN)", "Europe (UN)", "Americas (UN)", "Oceania",
+    "Overall"
+  ),
+  CFR = c(
+    8.25, 66.22, 34.26, 29.29,
+    55.38, 81.23, 50.00, 33.76,
+    34.12, 11.70,
+    7.86, 52.08, 54.87,
+    65.48, 33.58, 8.30, 11.70, 29.29,
+    51.33
+  ),
+  Lower = c(
+    1.23, 62.01, 29.63, 1.26,
+    49.61, 75.61, 9.43, 29.04,
+    18.64, 1.78,
+    1.17, 48.60, 44.70,
+    61.34, 28.85, 0.32, 1.78, 1.26,
+    48.07
+  ),
+  Upper = c(
+    24.87, 70.27, 39.10, 84.19,
+    61.05, 86.10, 90.57, 38.70,
+    52.35, 33.87,
+    23.82, 55.54, 64.78,
+    69.47, 38.54, 36.94, 33.87, 84.19,
+    54.57
+  ),
+  Category = c(
+    rep("Study Clusters", 4),
+    rep("WHO Regions", 6),
+    rep("World Bank Regions", 3),
+    rep("UN Regions", 5),
+    "Overall"
+  )
+)
+
+# Prepare labels
+
+library(stringr)
+
+cfr_data <- cfr_data %>%
+  mutate(
+    estext = sprintf("%.1f%%", CFR),  
+    Group_clean = str_remove(Group, "\\s*\\(.*\\)"),  # strip (WHO), (UN)
+    Category = factor(Category,
+                      levels = c("UN Regions", "WHO Regions",
+                                 "World Bank Regions", "Study Clusters", "Overall")),
+    Group = factor(Group, levels = rev(Group))  # keep order for plotting
+  )
+
+# Custom theme
+theme_ham <- function(base_size = 12, base_family = "sans"){
+  ggthemes::theme_fivethirtyeight(base_size, base_family) +
+    theme(
+      panel.spacing.y = unit(0.5, 'lines'), # more vertical space
+      panel.border = element_rect(color = "grey50", fill = NA, linewidth = 1),
+      plot.background = element_rect(fill='white', colour='white'),
+      panel.background = element_rect(fill='white', colour='white'),
+      strip.text = element_text(colour = 'white', face = 'bold'),
+      axis.title = element_text(),
+      strip.background = element_rect(colour = "grey50", fill = "grey50"),
+      legend.position = "none",
+      panel.grid.major = element_line(linetype = 3, linewidth = 0.2)
+    )
+}
+
+label_map <- setNames(as.character(cfr_data$Group_clean),
+                      cfr_data$Group)
+
+# Plot
+ggplot(cfr_data, aes(x = Group, y = CFR, colour = Category)) +
+  geom_point(size = 2, shape = 5) +
+  geom_linerange(aes(ymin = Lower, ymax = Upper), linewidth = 0.5) +
+  geom_text(aes(label = estext), hjust = 0.45, vjust = -0.5, 
+            size = 3, colour = "black") +
+  scale_x_discrete(labels = label_map) +  # match levels to clean labels
+  labs(y = "Case Fatality Rate (%)", x = "") +
+  coord_flip() +
+  theme_ham() +
+  scale_color_viridis_d(option = "C", end = 0.9) +
+  facet_grid(Category ~ ., scales = "free_y", space = "free_y", switch = "y") +
+  theme(strip.placement = "outside",
+        strip.text.y.left = element_text(angle = 0))
+
+```
+
